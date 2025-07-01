@@ -1,0 +1,646 @@
+// LST Shapefile Analysis Tool for Google Earth Engine
+// Upload a shapefile to get 10-year LST time series for the entire area
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+var startDate = '2014-01-01';
+var endDate = '2024-01-01';
+var scale = 30; // Landsat resolution
+
+// ============================================================================
+// FUNCTIONS
+// ============================================================================
+
+// Function to mask clouds in Landsat images
+function maskClouds(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudMask = qa.bitwiseAnd(1 << 3).eq(0)  // Cloud shadow
+                   .and(qa.bitwiseAnd(1 << 4).eq(0))  // Cloud
+                   .and(qa.bitwiseAnd(1 << 2).eq(0)); // Cirrus
+  return image.updateMask(cloudMask);
+}
+
+// Function to calculate LST from Landsat Collection 2
+function calculateLST(image) {
+  // Select surface temperature band (ST_B10)
+  var lst = image.select('ST_B10')
+    .multiply(0.00341802)  // Scale factor
+    .add(149.0)            // Offset
+    .subtract(273.15)      // Convert Kelvin to Celsius
+    .rename('LST');
+  
+  return image.addBands(lst);
+}
+
+// Function to process LST for uploaded shapefile
+function analyzeLSTForArea(geometry) {
+  // Clear previous layers
+  Map.layers().reset();
+  
+  // Calculate area in hectares for reference
+  var areaHa = geometry.area().divide(10000);
+  print('Analysis area:', areaHa, 'hectares');
+  
+  // Load Landsat 8 and 9 collections
+  var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(geometry)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUD_COVER', 30))  // Increased threshold for monsoon areas
+    .map(maskClouds)
+    .map(calculateLST);
+    
+  var landsat9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterBounds(geometry)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUD_COVER', 30))
+    .map(maskClouds)
+    .map(calculateLST);
+  
+  // Merge collections
+  var allLandsat = landsat8.merge(landsat9);
+  
+  print('Total images found:', allLandsat.size());
+  
+  // Function to extract LST values for each image
+  var extractLST = function(image) {
+    // Calculate area-weighted mean LST
+    var lstStats = image.select('LST').reduceRegion({
+      reducer: ee.Reducer.mean().combine({
+        reducer2: ee.Reducer.stdDev(),
+        sharedInputs: true
+      }).combine({
+        reducer2: ee.Reducer.count(),
+        sharedInputs: true
+      }),
+      geometry: geometry,
+      scale: scale,
+      maxPixels: 1e9,
+      bestEffort: true
+    });
+    
+    return ee.Feature(null, {
+      'date': image.date().format('YYYY-MM-dd'),
+      'LST_mean': lstStats.get('LST_mean'),
+      'LST_stdDev': lstStats.get('LST_stdDev'),
+      'LST_count': lstStats.get('LST_count'),
+      'year': image.date().get('year'),
+      'month': image.date().get('month'),
+      'day': image.date().get('day'),
+      'doy': image.date().getRelative('day', 'year')
+    });
+  };
+  
+  // Extract LST time series
+  var lstTimeSeries = allLandsat.map(extractLST);
+  
+  // Filter out null values
+  var validTimeSeries = lstTimeSeries.filter(ee.Filter.neq('LST_mean', null));
+  
+  print('Valid LST observations:', validTimeSeries.size());
+  print('LST Time Series Data (first 20 records):');
+  print(validTimeSeries.limit(20));
+  
+  // Calculate overall statistics
+  var lstValues = validTimeSeries.aggregate_array('LST_mean');
+  var validLST = lstValues.removeAll([null]);
+  
+  var stats = {
+    'count': validLST.size(),
+    'mean': validLST.reduce(ee.Reducer.mean()),
+    'min': validLST.reduce(ee.Reducer.min()),
+    'max': validLST.reduce(ee.Reducer.max()),
+    'std': validLST.reduce(ee.Reducer.stdDev()),
+    'median': validLST.reduce(ee.Reducer.median())
+  };
+  
+  print('=== OVERALL LST STATISTICS (°C) ===');
+  print('Total Observations:', stats.count);
+  print('Mean Temperature:', stats.mean);
+  print('Median Temperature:', stats.median);
+  print('Minimum Temperature:', stats.min);
+  print('Maximum Temperature:', stats.max);
+  print('Standard Deviation:', stats.std);
+  
+  // Monthly analysis to check for data bias
+  var months = ee.List.sequence(1, 12);
+  var monthlyStats = months.map(function(month) {
+    var monthData = validTimeSeries.filter(ee.Filter.eq('month', month));
+    var monthLST = monthData.aggregate_array('LST_mean');
+    var validMonthLST = monthLST.removeAll([null]);
+    
+    return ee.Feature(null, {
+      'month': month,
+      'count': validMonthLST.size(),
+      'mean_LST': validMonthLST.reduce(ee.Reducer.mean()),
+      'min_LST': validMonthLST.reduce(ee.Reducer.min()),
+      'max_LST': validMonthLST.reduce(ee.Reducer.max())
+    });
+  });
+  
+  print('=== MONTHLY LST ANALYSIS ===');
+  print('Month | Count | Mean°C | Min°C | Max°C');
+  print(ee.FeatureCollection(monthlyStats));
+  
+  // Annual averages
+  var years = ee.List.sequence(2014, 2023);
+  var yearlyLST = years.map(function(year) {
+    var yearData = validTimeSeries.filter(ee.Filter.eq('year', year));
+    var yearLST = yearData.aggregate_array('LST_mean');
+    var validYearLST = yearLST.removeAll([null]);
+    
+    return ee.Feature(null, {
+      'year': year,
+      'count': validYearLST.size(),
+      'yearly_mean_LST': validYearLST.reduce(ee.Reducer.mean()),
+      'yearly_min_LST': validYearLST.reduce(ee.Reducer.min()),
+      'yearly_max_LST': validYearLST.reduce(ee.Reducer.max())
+    });
+  });
+  
+  print('=== YEARLY AVERAGE LST ===');
+  print(ee.FeatureCollection(yearlyLST));
+  
+  // Seasonal analysis
+  var seasons = [
+    {name: 'Winter (Dec-Feb)', months: [12, 1, 2]},
+    {name: 'Spring (Mar-May)', months: [3, 4, 5]},
+    {name: 'Monsoon (Jun-Aug)', months: [6, 7, 8]},
+    {name: 'Post-Monsoon (Sep-Nov)', months: [9, 10, 11]}
+  ];
+  
+  print('=== SEASONAL LST ANALYSIS ===');
+  seasons.forEach(function(season) {
+    var seasonData = validTimeSeries.filter(ee.Filter.inList('month', season.months));
+    var seasonLST = seasonData.aggregate_array('LST_mean');
+    var validSeasonLST = seasonLST.removeAll([null]);
+    
+    print(season.name + ':');
+    print('  Count:', validSeasonLST.size());
+    print('  Mean LST:', validSeasonLST.reduce(ee.Reducer.mean()));
+    print('  Min LST:', validSeasonLST.reduce(ee.Reducer.min()));
+    print('  Max LST:', validSeasonLST.reduce(ee.Reducer.max()));
+  });
+  
+  // Visualize on map
+  Map.addLayer(geometry, {color: 'red', fillColor: 'FF000033'}, 'Analysis Area');
+  
+  // Get most recent LST image for visualization
+  var recentImage = allLandsat.sort('system:time_start', false).first();
+  var lstVis = {
+    min: 5,
+    max: 45,
+    palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red']
+  };
+  
+  Map.addLayer(recentImage.select('LST').clip(geometry), lstVis, 'Recent LST');
+  Map.centerObject(geometry, 12);
+  
+  // Create time series chart
+  var timeSeriesChart = ui.Chart.feature.byFeature(validTimeSeries, 'date', 'LST_mean')
+    .setChartType('LineChart')
+    .setOptions({
+      title: 'Land Surface Temperature Time Series - Area Average',
+      vAxis: {
+        title: 'LST (°C)',
+        titleTextStyle: {italic: false, bold: true}
+      },
+      hAxis: {
+        title: 'Date',
+        titleTextStyle: {italic: false, bold: true},
+        format: 'YYYY-MM'
+      },
+      series: {
+        0: {
+          color: 'red',
+          lineWidth: 2,
+          pointSize: 2
+        }
+      },
+      legend: {position: 'none'},
+      curveType: 'function',
+      backgroundColor: 'white'
+    });
+  
+  print('=== TIME SERIES CHART ===');
+  print(timeSeriesChart);
+  
+  // Create monthly average chart
+  var monthlyChart = ui.Chart.feature.byFeature(ee.FeatureCollection(monthlyStats), 'month', 'mean_LST')
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Monthly Average LST',
+      vAxis: {
+        title: 'Average LST (°C)',
+        titleTextStyle: {italic: false, bold: true}
+      },
+      hAxis: {
+        title: 'Month',
+        titleTextStyle: {italic: false, bold: true}
+      },
+      colors: ['#1f77b4'],
+      legend: {position: 'none'},
+      backgroundColor: 'white'
+    });
+  
+  print('=== MONTHLY AVERAGE CHART ===');
+  print(monthlyChart);
+  
+  // Export options
+  print('=== EXPORT OPTIONS ===');
+  print('Uncomment the Export.table.toDrive lines below to export data:');
+  
+  /*
+  // Export time series data
+  Export.table.toDrive({
+    collection: validTimeSeries,
+    description: 'LST_TimeSeries_Shapefile_' + Date.now(),
+    fileFormat: 'CSV',
+    selectors: ['date', 'LST_mean', 'LST_stdDev', 'LST_count', 'year', 'month', 'day']
+  });
+  
+  // Export monthly statistics
+  Export.table.toDrive({
+    collection: ee.FeatureCollection(monthlyStats),
+    description: 'LST_Monthly_Stats_' + Date.now(),
+    fileFormat: 'CSV'
+  });
+  
+  // Export yearly statistics
+  Export.table.toDrive({
+    collection: ee.FeatureCollection(yearlyLST),
+    description: 'LST_Yearly_Stats_' + Date.now(),
+    fileFormat: 'CSV'
+  });
+  */
+}
+
+// ============================================================================
+// USER INTERFACE SETUP
+// ============================================================================
+
+// Create upload dialog box
+function createUploadDialog() {
+  var dialog = ui.Panel({
+    widgets: [
+      ui.Label({
+        value: 'LST Shapefile Analysis Tool',
+        style: {fontSize: '20px', fontWeight: 'bold', color: '4A90E2', textAlign: 'center'}
+      }),
+      ui.Label({
+        value: 'Load Shapefile for Analysis',
+        style: {fontSize: '16px', fontWeight: 'bold', margin: '10px 0px 5px 0px'}
+      })
+    ],
+    style: {
+      position: 'top-center',
+      padding: '20px',
+      backgroundColor: 'white',
+      border: '2px solid #4A90E2',
+      width: '480px'
+    }
+  });
+
+  // Method selection
+  var methodPanel = ui.Panel({
+    widgets: [
+      ui.Label({
+        value: 'Choose input method:',
+        style: {fontSize: '14px', fontWeight: 'bold', color: '333'}
+      })
+    ],
+    style: {margin: '10px 0px'}
+  });
+
+  var methodSelect = ui.Select({
+    items: ['Use existing asset', 'Upload new shapefile', 'Use example data'],
+    value: 'Use existing asset',
+    style: {width: '100%', margin: '5px 0px'}
+  });
+
+  methodPanel.add(methodSelect);
+  dialog.add(methodPanel);
+
+  // Single asset path input
+  var assetPathInput = ui.Textbox({
+    placeholder: 'e.g., users/yourusername/yourshapefile',
+    style: {width: '100%', margin: '5px 0px'}
+  });
+
+  // Asset browser button
+  var browseButton = ui.Button({
+    label: '📁 Browse My Assets',
+    style: {backgroundColor: '#17a2b8', color: 'white', margin: '5px 0px'}
+  });
+
+  // Content panel that changes based on method
+  var contentPanel = ui.Panel({
+    widgets: [],
+    style: {margin: '10px 0px'}
+  });
+
+  // Upload instructions panel
+  var uploadInstructions = ui.Panel({
+    widgets: [
+      ui.Label({
+        value: 'Upload Instructions:',
+        style: {fontSize: '14px', fontWeight: 'bold', color: '333'}
+      }),
+      ui.Label('1. Go to Assets tab in the left panel'),
+      ui.Label('2. Click "NEW" → "Shape files"'),
+      ui.Label('3. Upload .shp, .shx, .dbf, .prj files'),
+      ui.Label('4. Wait for upload to complete'),
+      ui.Label('5. Copy asset path and paste below'),
+      ui.Label({
+        value: 'Then enter the asset path:',
+        style: {fontSize: '12px', fontWeight: 'bold', margin: '10px 0px 5px 0px'}
+      })
+    ]
+  });
+
+  // Example selection
+  var exampleSelect = ui.Select({
+    items: [
+      'Pokhara region (Rectangle)',
+      'Kathmandu Valley (Approx)',
+      'Nepal - Gandaki Province',
+      'Custom coordinates'
+    ],
+    value: 'Pokhara region (Rectangle)',
+    style: {width: '100%', margin: '5px 0px'}
+  });
+
+  // Custom coordinates inputs
+  var coordPanel = ui.Panel({
+    widgets: [],
+    style: {margin: '5px 0px'}
+  });
+
+  var lonMinInput = ui.Textbox({placeholder: 'Min Longitude', style: {width: '23%', margin: '1%'}});
+  var latMinInput = ui.Textbox({placeholder: 'Min Latitude', style: {width: '23%', margin: '1%'}});
+  var lonMaxInput = ui.Textbox({placeholder: 'Max Longitude', style: {width: '23%', margin: '1%'}});
+  var latMaxInput = ui.Textbox({placeholder: 'Max Latitude', style: {width: '23%', margin: '1%'}});
+
+  // Function to update content based on method
+  function updateContent() {
+    contentPanel.clear();
+    coordPanel.clear();
+    
+    var method = methodSelect.getValue();
+    
+    if (method === 'Use existing asset') {
+      contentPanel.add(ui.Label({
+        value: 'Asset Path:',
+        style: {fontSize: '14px', fontWeight: 'bold'}
+      }));
+      contentPanel.add(assetPathInput);
+      contentPanel.add(browseButton);
+      contentPanel.add(ui.Label({
+        value: 'Tip: Check your Assets tab for uploaded shapefiles',
+        style: {fontSize: '12px', color: '666', fontStyle: 'italic'}
+      }));
+      
+    } else if (method === 'Upload new shapefile') {
+      contentPanel.add(uploadInstructions);
+      contentPanel.add(ui.Label({
+        value: 'Asset Path (after upload):',
+        style: {fontSize: '14px', fontWeight: 'bold'}
+      }));
+      contentPanel.add(assetPathInput);
+      
+    } else if (method === 'Use example data') {
+      contentPanel.add(ui.Label({
+        value: 'Select example area:',
+        style: {fontSize: '14px', fontWeight: 'bold'}
+      }));
+      contentPanel.add(exampleSelect);
+      
+      // Show coordinate inputs for custom option
+      exampleSelect.onChange(function(value) {
+        coordPanel.clear();
+        if (value === 'Custom coordinates') {
+          coordPanel.add(ui.Label('Enter bounding box coordinates:'));
+          var coordRow = ui.Panel([lonMinInput, latMinInput, lonMaxInput, latMaxInput], 
+                                 ui.Panel.Layout.flow('horizontal'));
+          coordPanel.add(coordRow);
+          coordPanel.add(ui.Label({
+            value: '(Min Lon, Min Lat, Max Lon, Max Lat)',
+            style: {fontSize: '11px', color: '666'}
+          }));
+        }
+      });
+      contentPanel.add(coordPanel);
+    }
+  }
+
+  // Initial content update
+  updateContent();
+  methodSelect.onChange(updateContent);
+  
+  dialog.add(contentPanel);
+
+  // Feature selection for multi-feature shapefiles
+  var featurePanel = ui.Panel({
+    widgets: [
+      ui.Label({
+        value: 'Feature Selection (for multi-feature shapefiles):',
+        style: {fontSize: '14px', fontWeight: 'bold', margin: '10px 0px 5px 0px'}
+      })
+    ],
+    style: {margin: '10px 0px'}
+  });
+
+  var featureSelect = ui.Select({
+    items: ['Use all features (merged)', 'Use first feature only', 'Select by property'],
+    value: 'Use all features (merged)',
+    style: {width: '100%'}
+  });
+
+  var propertyPanel = ui.Panel({
+    widgets: [],
+    style: {margin: '5px 0px'}
+  });
+
+  var propertyInput = ui.Textbox({
+    placeholder: 'Property name (e.g., NAME, DISTRICT)',
+    style: {width: '48%', margin: '2px'}
+  });
+
+  var valueInput = ui.Textbox({
+    placeholder: 'Property value (e.g., Pokhara)',
+    style: {width: '48%', margin: '2px'}
+  });
+
+  // Show/hide property inputs based on selection
+  featureSelect.onChange(function(value) {
+    propertyPanel.clear();
+    if (value === 'Select by property') {
+      propertyPanel.add(ui.Label('Filter by property:'));
+      var propRow = ui.Panel([propertyInput, valueInput], ui.Panel.Layout.flow('horizontal'));
+      propertyPanel.add(propRow);
+    }
+  });
+
+  featurePanel.add(featureSelect);
+  featurePanel.add(propertyPanel);
+  dialog.add(featurePanel);
+
+  // Buttons
+  var buttonPanel = ui.Panel({
+    widgets: [],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {margin: '15px 0px 5px 0px'}
+  });
+
+  var loadButton = ui.Button({
+    label: 'Load & Analyze',
+    style: {backgroundColor: '#28a745', color: 'black', fontWeight: 'bold', width: '120px'}
+  });
+
+  var exampleButton = ui.Button({
+    label: 'Use Example',
+    style: {backgroundColor: '#28a745', color: 'black', width: '120px'}
+  });
+
+  var cancelButton = ui.Button({
+    label: 'Cancel',
+    style: {backgroundColor: '#dc3545', color: 'white', width: '80px'}
+  });
+
+  buttonPanel.add(loadButton);
+  buttonPanel.add(exampleButton);
+  buttonPanel.add(cancelButton);
+  dialog.add(buttonPanel);
+
+  // Button functions
+  loadButton.onClick(function() {
+    // Change button to white when clicked
+    loadButton.style().set({backgroundColor: 'white', color: 'black'});
+    
+    var method = methodSelect.getValue();
+    var geometry;
+    
+    if (method === 'Use example data') {
+      var exampleType = exampleSelect.getValue();
+      if (exampleType === 'Custom coordinates') {
+        var lonMin = parseFloat(lonMinInput.getValue());
+        var latMin = parseFloat(latMinInput.getValue());
+        var lonMax = parseFloat(lonMaxInput.getValue());
+        var latMax = parseFloat(latMaxInput.getValue());
+        
+        if (isNaN(lonMin) || isNaN(latMin) || isNaN(lonMax) || isNaN(latMax)) {
+          print('ERROR: Please enter valid coordinates');
+          loadButton.style().set({backgroundColor: '#28a745', color: 'black'});
+          return;
+        }
+        geometry = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax]);
+      } else {
+        // Use predefined example areas
+        var examples = {
+          'Pokhara region (Rectangle)': ee.Geometry.Rectangle([83.8, 28.1, 84.1, 28.3]),
+          'Kathmandu Valley (Approx)': ee.Geometry.Rectangle([85.0, 27.5, 85.5, 27.9]),
+          'Nepal - Gandaki Province': ee.Geometry.Rectangle([83.0, 27.8, 85.0, 29.0])
+        };
+        geometry = examples[exampleType];
+      }
+      
+      Map.remove(dialog);
+      print('Loading example area:', exampleType);
+      analyzeLSTForArea(geometry);
+      
+    } else {
+      var assetPath = assetPathInput.getValue();
+      if (!assetPath) {
+        print('ERROR: Please enter an asset path');
+        loadButton.style().set({backgroundColor: '#28a745', color: 'black'});
+        return;
+      }
+      
+      print('Loading shapefile from:', assetPath);
+      
+      try {
+        var fc = ee.FeatureCollection(assetPath);
+        
+        var selection = featureSelect.getValue();
+        if (selection === 'Use all features (merged)') {
+          geometry = fc.geometry();
+        } else if (selection === 'Use first feature only') {
+          geometry = fc.first().geometry();
+        } else if (selection === 'Select by property') {
+          var propName = propertyInput.getValue();
+          var propValue = valueInput.getValue();
+          if (!propName || !propValue) {
+            print('ERROR: Please enter both property name and value');
+            loadButton.style().set({backgroundColor: '#28a745', color: 'black'});
+            return;
+          }
+          geometry = fc.filter(ee.Filter.eq(propName, propValue)).geometry();
+        }
+        
+        Map.remove(dialog);
+        print('Shapefile loaded successfully! Starting analysis...');
+        analyzeLSTForArea(geometry);
+        
+      } catch (error) {
+        print('ERROR loading shapefile:', error);
+        print('Please check:');
+        print('1. Asset path is correct');
+        print('2. Asset has been shared (if not yours)');
+        print('3. Asset upload completed successfully');
+        loadButton.style().set({backgroundColor: '#28a745', color: 'black'});
+      }
+    }
+  });
+
+  exampleButton.onClick(function() {
+    // Change button to white when clicked
+    exampleButton.style().set({backgroundColor: 'white', color: 'black'});
+    
+    Map.remove(dialog);
+    print('Loading example area (Pokhara region)...');
+    var exampleGeometry = ee.Geometry.Rectangle([83.8, 28.1, 84.1, 28.3]);
+    analyzeLSTForArea(exampleGeometry);
+  });
+
+  cancelButton.onClick(function() {
+    Map.remove(dialog);
+    print('Upload cancelled. You can restart by refreshing the page.');
+  });
+
+  // Status panel
+  var statusPanel = ui.Panel({
+    widgets: [
+      ui.Label({
+        value: 'Status: Ready for shapefile upload',
+        style: {fontSize: '12px', color: '666', fontStyle: 'italic'}
+      })
+    ],
+    style: {margin: '10px 0px 0px 0px'}
+  });
+  dialog.add(statusPanel);
+
+  return dialog;
+}
+
+// Create and show the upload dialog
+var uploadDialog = createUploadDialog();
+Map.add(uploadDialog);
+
+// ============================================================================
+// INITIAL SETUP
+// ============================================================================
+
+// Set initial map view (Nepal area)
+Map.setCenter(84.0, 28.2, 8); // Nepal center
+Map.setOptions('SATELLITE');
+
+// Display instructions
+print('============================================================');
+print('LST SHAPEFILE ANALYSIS TOOL');
+print('============================================================');
+print('A dialog box has appeared on the map.');
+print('Follow the steps in the dialog to upload and analyze your shapefile.');
+print('');
+print('If you don\'t see the dialog, it might be hidden behind other panels.');
+print('You can also use the "Use Example" button to test with Pokhara area.');
+print('============================================================');
